@@ -18,7 +18,7 @@ import cv2
 from PIL import Image
 
 # Define the location of the directory
-image_path =r"D:/PostDoc Project/POCUS Shoulder Data/001/001_left.dcm"
+image_path =r"POCUS Shoulder Data/Final US Data/1/1_Philips/001_left.dcm"
 
 ds = dicom.dcmread(image_path)
 image = ds.pixel_array

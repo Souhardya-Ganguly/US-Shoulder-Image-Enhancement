@@ -1,0 +1,21 @@
+
+# Models
+*.pt
+*.pth
+*.ckpt
+
+# raw data + generated artifacts
+POCUS Shoulder Data/
+qc_frames/
+datasets/
+runs/
+results/
+
+# python env
+venv/
+__pycache__/
+*.pyc
+
+# OS junk
+.DS_Store
+
