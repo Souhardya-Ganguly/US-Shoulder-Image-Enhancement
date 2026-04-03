@@ -15,6 +15,9 @@ import torch.nn as nn
 import torchvision.transforms as T
 from torchvision.models import inception_v3
 
+import cv2
+import lpips
+
 from scipy import linalg
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
@@ -262,35 +265,222 @@ def extract_inception_features(paths: List[str],
     return np.concatenate(feats, axis=0)
 
 
-def compute_fid(samples: Dict[str, Dict[str, str]],
-                device: str,
-                max_images: Optional[int] = None,
-                batch_size: int = 16) -> Dict[str, float]:
-    """
-    Compute FID between fake_A and real_A sets.
-    """
-    fakeA_paths, realA_paths = [], []
-    for k in sorted(samples.keys()):
-        d = samples[k]
-        if "fake_A" in d and "real_A" in d:
-            fakeA_paths.append(d["fake_A"])
-            realA_paths.append(d["real_A"])
+def compute_fid_pair(fake_paths: List[str], real_paths: List[str],
+                     device: str, batch_size: int, label: str) -> Dict[str, float]:
+    """Compute FID between two sets of image paths."""
+    if len(fake_paths) < 10:
+        return {f"fid_{label}": float("nan"), f"n_fid_{label}": int(len(fake_paths))}
 
-    if max_images is not None:
-        fakeA_paths = fakeA_paths[:max_images]
-        realA_paths = realA_paths[:max_images]
-
-    if len(fakeA_paths) < 10:
-        return {"fid_fakeA_realA": float("nan"), "n_fid_images": int(len(fakeA_paths))}
-
-    feats_fake = extract_inception_features(fakeA_paths, device=device, batch_size=batch_size)
-    feats_real = extract_inception_features(realA_paths, device=device, batch_size=batch_size)
+    feats_fake = extract_inception_features(fake_paths, device=device, batch_size=batch_size)
+    feats_real = extract_inception_features(real_paths, device=device, batch_size=batch_size)
 
     mu_f, sig_f = compute_stats(feats_fake)
     mu_r, sig_r = compute_stats(feats_real)
 
     fid = frechet_distance(mu_f, sig_f, mu_r, sig_r)
-    return {"fid_fakeA_realA": float(fid), "n_fid_images": int(len(fakeA_paths))}
+    return {f"fid_{label}": float(fid), f"n_fid_{label}": int(len(fake_paths))}
+
+
+def compute_fid(samples: Dict[str, Dict[str, str]],
+                device: str,
+                max_images: Optional[int] = None,
+                batch_size: int = 16) -> Dict[str, float]:
+    """
+    Compute FID for both directions:
+      fake_A vs real_A  (backward: B->A quality)
+      fake_B vs real_B  (forward: A->B quality — the enhancement direction)
+    """
+    fakeA_paths, realA_paths = [], []
+    fakeB_paths, realB_paths = [], []
+    for k in sorted(samples.keys()):
+        d = samples[k]
+        if "fake_A" in d and "real_A" in d:
+            fakeA_paths.append(d["fake_A"])
+            realA_paths.append(d["real_A"])
+        if "fake_B" in d and "real_B" in d:
+            fakeB_paths.append(d["fake_B"])
+            realB_paths.append(d["real_B"])
+
+    if max_images is not None:
+        fakeA_paths = fakeA_paths[:max_images]
+        realA_paths = realA_paths[:max_images]
+        fakeB_paths = fakeB_paths[:max_images]
+        realB_paths = realB_paths[:max_images]
+
+    out = {}
+    out.update(compute_fid_pair(fakeA_paths, realA_paths, device, batch_size, "fakeA_realA"))
+    out.update(compute_fid_pair(fakeB_paths, realB_paths, device, batch_size, "fakeB_realB"))
+    return out
+
+
+# ----------------------------
+# LPIPS (perceptual similarity on reconstructions)
+# ----------------------------
+@torch.no_grad()
+def compute_lpips(samples: Dict[str, Dict[str, str]],
+                  device: str,
+                  max_pairs: Optional[int] = None) -> Dict[str, float]:
+    """
+    Compute LPIPS (lower = more similar) on cycle reconstruction pairs:
+      rec_A vs real_A and rec_B vs real_B.
+    """
+    loss_fn = lpips.LPIPS(net="alex").to(device)
+    loss_fn.eval()
+
+    lpips_A, lpips_B = [], []
+
+    keys = sorted(samples.keys())
+    if max_pairs is not None:
+        keys = keys[:max_pairs]
+
+    for k in tqdm(keys, desc="LPIPS"):
+        d = samples[k]
+
+        if "real_A" in d and "rec_A" in d:
+            a = Image.open(d["real_A"]).convert("L").convert("RGB")
+            ra = Image.open(d["rec_A"]).convert("L").convert("RGB")
+            tfm = T.Compose([T.ToTensor(), T.Normalize(0.5, 0.5)])  # [-1, 1]
+            ta = tfm(a).unsqueeze(0).to(device)
+            tra = tfm(ra).unsqueeze(0).to(device)
+            lpips_A.append(loss_fn(ta, tra).item())
+
+        if "real_B" in d and "rec_B" in d:
+            b = Image.open(d["real_B"]).convert("L").convert("RGB")
+            rb = Image.open(d["rec_B"]).convert("L").convert("RGB")
+            tfm = T.Compose([T.ToTensor(), T.Normalize(0.5, 0.5)])
+            tb = tfm(b).unsqueeze(0).to(device)
+            trb = tfm(rb).unsqueeze(0).to(device)
+            lpips_B.append(loss_fn(tb, trb).item())
+
+    out = {}
+    out["lpips_recA_realA_mean"] = float(np.mean(lpips_A)) if lpips_A else float("nan")
+    out["lpips_recB_realB_mean"] = float(np.mean(lpips_B)) if lpips_B else float("nan")
+    return out
+
+
+# ----------------------------
+# Sharpness (Tenengrad — Sobel gradient magnitude)
+# ----------------------------
+def tenengrad_sharpness(img_gray: np.ndarray) -> float:
+    """Tenengrad sharpness: mean of squared Sobel gradient magnitudes."""
+    gx = cv2.Sobel(img_gray, cv2.CV_64F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img_gray, cv2.CV_64F, 0, 1, ksize=3)
+    return float(np.mean(gx ** 2 + gy ** 2))
+
+
+def compute_sharpness(samples: Dict[str, Dict[str, str]],
+                      max_images: Optional[int] = None) -> Dict[str, float]:
+    """
+    Compute Tenengrad sharpness for fake_B, real_B, and their ratio.
+    Ratio close to 1.0 means the enhanced images preserve edge sharpness.
+    > 1.0 means sharper than reference, < 1.0 means blurrier.
+    """
+    sharp_fakeB, sharp_realB = [], []
+    sharp_fakeA, sharp_realA = [], []
+
+    keys = sorted(samples.keys())
+    if max_images is not None:
+        keys = keys[:max_images]
+
+    for k in tqdm(keys, desc="Sharpness"):
+        d = samples[k]
+        if "fake_B" in d:
+            sharp_fakeB.append(tenengrad_sharpness(load_grayscale_uint8(d["fake_B"])))
+        if "real_B" in d:
+            sharp_realB.append(tenengrad_sharpness(load_grayscale_uint8(d["real_B"])))
+        if "fake_A" in d:
+            sharp_fakeA.append(tenengrad_sharpness(load_grayscale_uint8(d["fake_A"])))
+        if "real_A" in d:
+            sharp_realA.append(tenengrad_sharpness(load_grayscale_uint8(d["real_A"])))
+
+    out = {}
+    out["sharpness_fakeB_mean"] = float(np.mean(sharp_fakeB)) if sharp_fakeB else float("nan")
+    out["sharpness_realB_mean"] = float(np.mean(sharp_realB)) if sharp_realB else float("nan")
+    out["sharpness_fakeA_mean"] = float(np.mean(sharp_fakeA)) if sharp_fakeA else float("nan")
+    out["sharpness_realA_mean"] = float(np.mean(sharp_realA)) if sharp_realA else float("nan")
+
+    if sharp_fakeB and sharp_realB:
+        out["sharpness_ratio_fakeB_realB"] = out["sharpness_fakeB_mean"] / out["sharpness_realB_mean"]
+    else:
+        out["sharpness_ratio_fakeB_realB"] = float("nan")
+
+    return out
+
+
+# ----------------------------
+# CNR (Contrast-to-Noise Ratio)
+# ----------------------------
+def compute_cnr_single(img_gray: np.ndarray,
+                       bright_pct: float = 90,
+                       dark_low_pct: float = 20,
+                       dark_high_pct: float = 40) -> float:
+    """
+    Automatic CNR for ultrasound images.
+
+    Bright ROI: pixels above the bright_pct percentile (humerus cortex / bright structures).
+    Dark ROI: pixels between dark_low_pct and dark_high_pct percentiles (soft tissue).
+
+    CNR = |mean_bright - mean_dark| / sqrt((var_bright + var_dark) / 2)
+    """
+    img = img_gray.astype(np.float64)
+    bright_thresh = np.percentile(img, bright_pct)
+    dark_low = np.percentile(img, dark_low_pct)
+    dark_high = np.percentile(img, dark_high_pct)
+
+    bright_pixels = img[img >= bright_thresh]
+    dark_pixels = img[(img >= dark_low) & (img <= dark_high)]
+
+    if len(bright_pixels) < 10 or len(dark_pixels) < 10:
+        return float("nan")
+
+    mean_b = bright_pixels.mean()
+    mean_d = dark_pixels.mean()
+    var_b = bright_pixels.var()
+    var_d = dark_pixels.var()
+
+    denom = np.sqrt((var_b + var_d) / 2.0)
+    if denom < 1e-8:
+        return float("nan")
+
+    return float(abs(mean_b - mean_d) / denom)
+
+
+def compute_cnr(samples: Dict[str, Dict[str, str]],
+                max_images: Optional[int] = None) -> Dict[str, float]:
+    """
+    Compute CNR for fake_B (enhanced), real_B (Philips reference),
+    real_A (Telemed source), and fake_A (degraded Philips).
+    Higher CNR = better contrast between cortex and tissue.
+    """
+    cnr_fakeB, cnr_realB, cnr_realA, cnr_fakeA = [], [], [], []
+
+    keys = sorted(samples.keys())
+    if max_images is not None:
+        keys = keys[:max_images]
+
+    for k in tqdm(keys, desc="CNR"):
+        d = samples[k]
+        if "fake_B" in d:
+            cnr_fakeB.append(compute_cnr_single(load_grayscale_uint8(d["fake_B"])))
+        if "real_B" in d:
+            cnr_realB.append(compute_cnr_single(load_grayscale_uint8(d["real_B"])))
+        if "real_A" in d:
+            cnr_realA.append(compute_cnr_single(load_grayscale_uint8(d["real_A"])))
+        if "fake_A" in d:
+            cnr_fakeA.append(compute_cnr_single(load_grayscale_uint8(d["fake_A"])))
+
+    out = {}
+    out["cnr_fakeB_mean"] = float(np.nanmean(cnr_fakeB)) if cnr_fakeB else float("nan")
+    out["cnr_realB_mean"] = float(np.nanmean(cnr_realB)) if cnr_realB else float("nan")
+    out["cnr_realA_mean"] = float(np.nanmean(cnr_realA)) if cnr_realA else float("nan")
+    out["cnr_fakeA_mean"] = float(np.nanmean(cnr_fakeA)) if cnr_fakeA else float("nan")
+
+    if cnr_fakeB and cnr_realB:
+        out["cnr_ratio_fakeB_realB"] = out["cnr_fakeB_mean"] / out["cnr_realB_mean"]
+    else:
+        out["cnr_ratio_fakeB_realB"] = float("nan")
+
+    return out
 
 
 # ----------------------------
@@ -326,8 +516,17 @@ def main():
     # histogram KL (distribution)
     metrics.update(compute_hist_kl(samples, bins=args.hist_bins, max_images=args.max_images))
 
-    # FID (distribution)
+    # FID (distribution — both directions)
     metrics.update(compute_fid(samples, device=args.device, max_images=args.max_images, batch_size=args.fid_batch))
+
+    # LPIPS (perceptual similarity on reconstructions)
+    metrics.update(compute_lpips(samples, device=args.device, max_pairs=args.max_images))
+
+    # Sharpness (Tenengrad)
+    metrics.update(compute_sharpness(samples, max_images=args.max_images))
+
+    # CNR (Contrast-to-Noise Ratio)
+    metrics.update(compute_cnr(samples, max_images=args.max_images))
 
     # Save outputs
     out_json = Path(args.results_root) / args.run_name / "metrics.json"
@@ -346,14 +545,45 @@ def main():
         f.write(",".join(str(metrics[k]) for k in keys) + "\n")
     print(f"Saved: {out_csv}\n")
 
-    # Print summary
-    print("=== Summary ===")
-    for k in ["fid_fakeA_realA",
-              "hist_kl_fakeA_realA",
-              "ssim_recB_realB_mean", "psnr_recB_realB_mean",
-              "ssim_recA_realA_mean", "psnr_recA_realA_mean"]:
-        if k in metrics:
-            print(f"{k}: {metrics[k]}")
+    # Print results table
+    print(f"\n{'=' * 70}")
+    print(f"  EVALUATION RESULTS: {args.run_name}")
+    print(f"{'=' * 70}")
+
+    def row(metric, value, direction, description):
+        val_str = f"{value:.4f}" if isinstance(value, float) and not np.isnan(value) else str(value)
+        print(f"  {metric:<35s} {val_str:>10s}  {direction:<6s}  {description}")
+
+    print(f"\n  {'Metric':<35s} {'Value':>10s}  {'Goal':<6s}  Description")
+    print(f"  {'-' * 66}")
+
+    # --- Translation Quality (A->B: the enhancement direction) ---
+    print(f"\n  ** Translation Quality (A->B Enhancement) **")
+    row("FID (fake_B vs real_B)",       metrics.get("fid_fakeB_realB", float("nan")),     "(low)", "Distribution similarity to Philips")
+    row("Sharpness fake_B",             metrics.get("sharpness_fakeB_mean", float("nan")), "",      "Tenengrad on enhanced images")
+    row("Sharpness real_B",             metrics.get("sharpness_realB_mean", float("nan")), "",      "Tenengrad on real Philips")
+    row("Sharpness ratio (fB/rB)",      metrics.get("sharpness_ratio_fakeB_realB", float("nan")), "(~1.0)", "Edge preservation")
+    row("CNR fake_B",                   metrics.get("cnr_fakeB_mean", float("nan")),         "(high)", "Contrast-to-noise on enhanced")
+    row("CNR real_B",                   metrics.get("cnr_realB_mean", float("nan")),         "",       "Contrast-to-noise on real Philips")
+    row("CNR real_A",                   metrics.get("cnr_realA_mean", float("nan")),         "",       "Contrast-to-noise on real Telemed")
+    row("CNR ratio (fB/rB)",            metrics.get("cnr_ratio_fakeB_realB", float("nan")), "(~1.0)", "CNR preservation vs Philips")
+
+    # --- Backward Translation (B->A) ---
+    print(f"\n  ** Backward Translation (B->A) **")
+    row("FID (fake_A vs real_A)",       metrics.get("fid_fakeA_realA", float("nan")),     "(low)", "Distribution similarity to Telemed")
+    row("Hist KL (fake_A || real_A)",   metrics.get("hist_kl_fakeA_realA", float("nan")), "(low)", "Intensity distribution match")
+
+    # --- Cycle Consistency ---
+    print(f"\n  ** Cycle Consistency (Reconstruction) **")
+    row("SSIM (rec_A vs real_A)",       metrics.get("ssim_recA_realA_mean", float("nan")), "(high)", "Structural similarity after A->B->A")
+    row("PSNR (rec_A vs real_A)",       metrics.get("psnr_recA_realA_mean", float("nan")), "(high)", "Pixel fidelity after A->B->A")
+    row("LPIPS (rec_A vs real_A)",      metrics.get("lpips_recA_realA_mean", float("nan")), "(low)", "Perceptual distance after A->B->A")
+    row("SSIM (rec_B vs real_B)",       metrics.get("ssim_recB_realB_mean", float("nan")), "(high)", "Structural similarity after B->A->B")
+    row("PSNR (rec_B vs real_B)",       metrics.get("psnr_recB_realB_mean", float("nan")), "(high)", "Pixel fidelity after B->A->B")
+    row("LPIPS (rec_B vs real_B)",      metrics.get("lpips_recB_realB_mean", float("nan")), "(low)", "Perceptual distance after B->A->B")
+
+    print(f"\n  Samples: A={metrics.get('n_pairs_A', 0)}, B={metrics.get('n_pairs_B', 0)}")
+    print(f"{'=' * 70}\n")
 
 if __name__ == "__main__":
     main()

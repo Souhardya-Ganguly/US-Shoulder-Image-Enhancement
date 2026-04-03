@@ -10,6 +10,11 @@ qc_frames/
 datasets/
 runs/
 results/
+checkpoints/
+
+# Claude Code
+CLAUDE.md
+.claude/
 
 # python env
 venv/
