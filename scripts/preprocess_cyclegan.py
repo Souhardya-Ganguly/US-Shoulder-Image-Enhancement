@@ -12,13 +12,9 @@ from PIL import Image
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 
-# Your computed crop for Philips (x0,y0,x1,y1)
+# Computed crop boxes for each device (x0, y0, x1, y1)
 PHILIPS_CROP = (228, 102, 788, 516)
-
-# set this to your Telemed crop (x0,y0,x1,y1)
 TELEMED_CROP = (120, 0, 900, 679)
-
-import numpy as np
 
 def has_telemed_black_side_borders(img: np.ndarray,
                                    side_width=80,
@@ -343,21 +339,11 @@ def main():
             for t in idxs:
                 y = frames_gray[t]  # already grayscale uint8
 
-                # ✅ FIX 1: domain crop logic is INSIDE the frame loop
                 if dom == "A":
                     y = apply_crop(y, PHILIPS_CROP)
                 elif dom == "B":
-                    left_strip = y[:, :60]
-                    right_strip = y[:, -60:]
-                    left_dark_frac = (left_strip <= 15).mean()
-                    right_dark_frac = (right_strip <= 15).mean()
-                    print(f"[DEBUG] {dcm_path.name} frame={t} | H={y.shape[0]} W={y.shape[1]} | left_dark={left_dark_frac:.2f} right_dark={right_dark_frac:.2f}")
-
                     if has_telemed_black_side_borders(y, side_width=60, dark_threshold=15, min_dark_fraction=0.90):
-                        print(f"[DEBUG] → Applying TELEMED_CROP {TELEMED_CROP}")
                         y = apply_crop(y, TELEMED_CROP)
-                    else:
-                        print(f"[DEBUG] → No crop applied")
 
                 y = resize(y, args.img_size)
 
